@@ -1,19 +1,19 @@
+use crate::reactor::Reactor;
+use futures::{future::LocalBoxFuture, Future, FutureExt};
 use std::{
     cell::RefCell,
     collections::VecDeque,
     marker::PhantomData,
     mem,
+    pin::Pin,
     rc::Rc,
-    task::{RawWaker, RawWakerVTable, Waker, Context}, pin::Pin,
+    task::{Context, RawWaker, RawWakerVTable, Waker},
 };
-
-use futures::{future::LocalBoxFuture, Future, FutureExt};
-
-use crate::reactor::Reactor;
-
 scoped_tls::scoped_thread_local!(pub(crate) static EX: Executor);
 
+/// `Executor`负责`Task`的调度和执行
 pub struct Executor {
+    /// 等待调度的`Task`队列
     local_queue: TaskQueue,
     pub(crate) reactor: Rc<RefCell<Reactor>>,
 
@@ -27,8 +27,8 @@ impl Default for Executor {
     }
 }
 
-
 impl Executor {
+    /// 创建一个新的`Executor`
     pub fn new() -> Self {
         Self {
             local_queue: TaskQueue::default(),
@@ -38,6 +38,8 @@ impl Executor {
         }
     }
 
+    /// 一个`async fn`可以认为是一个`Future`
+    /// `spawn`将`Future`加入调度队列
     pub fn spawn(fut: impl Future<Output = ()> + 'static) {
         let t = Rc::new(Task {
             future: RefCell::new(fut.boxed_local()),
@@ -45,6 +47,11 @@ impl Executor {
         EX.with(|ex| ex.local_queue.push(t));
     }
 
+    /// 创建一个 dummy_waker，这个 waker 其实啥事不做。
+    /// (in loop)poll 传入的 future，检查是否 ready，如果 ready 就返回，结束 block_on。
+    /// (in loop)循环处理 TaskQueue 中的所有 Task：构建它对应的 Waker 然后 poll 它。
+    /// (in loop)这时已经没有待执行的任务了，可能主 future 已经 ready 了，也可能都在等待 IO。所以再次检查主 future，如果 ready 就返回。
+    /// (in loop)既然所有人都在等待 IO，那就 reactor.wait()。这时 reactor 会陷入 syscall 等待至少一个 IO 可执行，然后唤醒对应 Task，会向 TaskQueue 里推任务。
     pub fn block_on<F, T, O>(&self, f: F) -> O
     where
         F: Fn() -> T,
@@ -82,6 +89,7 @@ impl Executor {
     }
 }
 
+/// 存储`Task`的队列
 pub struct TaskQueue {
     queue: RefCell<VecDeque<Rc<Task>>>,
 }
@@ -93,31 +101,38 @@ impl Default for TaskQueue {
 }
 
 impl TaskQueue {
+    /// 创建一个新的`TaskQueue`
     pub fn new() -> Self {
         const DEFAULT_TASK_QUEUE_SIZE: usize = 4096;
         Self::new_with_capacity(DEFAULT_TASK_QUEUE_SIZE)
     }
+
+    /// 创建一个新的`TaskQueue`
     pub fn new_with_capacity(capacity: usize) -> Self {
         Self {
             queue: RefCell::new(VecDeque::with_capacity(capacity)),
         }
     }
 
+    /// 添加一个`Task`
     pub(crate) fn push(&self, runnable: Rc<Task>) {
         println!("add task");
         self.queue.borrow_mut().push_back(runnable);
     }
 
+    /// 删除第一个`Task`
     pub(crate) fn pop(&self) -> Option<Rc<Task>> {
         println!("remove task");
         self.queue.borrow_mut().pop_front()
     }
 }
 
+/// `Task`是对`Future`的一个简单封装
 pub struct Task {
     future: RefCell<LocalBoxFuture<'static, ()>>,
 }
 
+/// 创建一个和`Task`关联的`Waker`, 当`Task`准备好执行的时候, 调用`Waker`提供的`wake`和`wake_by_ref`方法
 fn waker(wake: Rc<Task>) -> Waker {
     let ptr = Rc::into_raw(wake) as *const ();
     let vtable = &Helper::VTABLE;
@@ -125,10 +140,12 @@ fn waker(wake: Rc<Task>) -> Waker {
 }
 
 impl Task {
+    /// 唤醒`Task`, 添加到调度队列中等待调度
     fn wake_(self: Rc<Self>) {
         Self::wake_by_ref_(&self)
     }
 
+    /// 唤醒`Task`, 添加到调度队列中等待调度
     fn wake_by_ref_(self: &Rc<Self>) {
         EX.with(|ex| ex.local_queue.push(self.clone()));
     }
